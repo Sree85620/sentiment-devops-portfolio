@@ -1,0 +1,104 @@
+###############################################################################
+# argocd/sentiment-argocd-app.yaml
+#
+# GitOps Configuration — ArgoCD Application
+# ─────────────────────────────────────────────────────────────────────────────
+# Prerequisites on Ubuntu host:
+#   1. ArgoCD installed in cluster:
+#      kubectl create namespace argocd
+#      kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+#
+#   2. ArgoCD CLI:
+#      curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+#      chmod +x /usr/local/bin/argocd
+#
+#   3. Expose ArgoCD UI locally:
+#      kubectl port-forward svc/argocd-server -n argocd 8080:443
+#      argocd login localhost:8080 --insecure --username admin \
+#        --password $(kubectl -n argocd get secret argocd-initial-admin-secret \
+#        -o jsonpath="{.data.password}" | base64 -d)
+#
+#   4. Register the local git repo (file:// for on-disk path):
+#      argocd repo add file:///home/$USER/sentiment-portfolio \
+#        --type git --name local-sentiment
+#
+#   5. Apply this manifest:
+#      kubectl apply -f argocd/sentiment-argocd-app.yaml
+#
+# ── How ArgoCD syncs a LOCAL path ────────────────────────────────────────────
+# ArgoCD's `repoURL: file:///...` tells it to watch a bare or normal git repo
+# on the local filesystem. It periodically diffs the live cluster state against
+# the YAML files in `path: k8s-manifests` on the tracked `targetRevision`
+# branch (HEAD here means the current checked-out branch).
+#
+# Workflow:
+#   Edit k8s-manifests/deployment.yaml
+#   → git add . && git commit -m "bump replicas"
+#   → ArgoCD detects diff within syncPolicy.automated.pollInterval (3 min default)
+#   → kubectl apply is issued automatically (syncPolicy.automated.selfHeal)
+###############################################################################
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sentiment-api
+  namespace: argocd          # ArgoCD always manages Applications in its own ns
+  labels:
+    project: sentiment-portfolio
+    environment: local-dev
+  # Finalizer ensures ArgoCD cleans up cluster resources when the App is deleted
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  # ── Project ────────────────────────────────────────────────────────────────
+  project: default           # Use 'default' project; create custom for RBAC
+
+  # ── Source ─────────────────────────────────────────────────────────────────
+  source:
+    # file:// URI points to the local git repository on the Ubuntu host.
+    # Replace $USER with your actual username or use an absolute path.
+    repoURL: file:///home/ubuntu/sentiment-portfolio
+    targetRevision: HEAD      # Track HEAD of the current branch (e.g. main)
+    path: k8s-manifests       # Sub-directory containing the Kubernetes YAML files
+
+  # ── Destination ────────────────────────────────────────────────────────────
+  destination:
+    server: https://kubernetes.default.svc   # In-cluster API (Minikube/K3s)
+    namespace: sentiment                      # Target namespace for resources
+
+  # ── Sync Policy ────────────────────────────────────────────────────────────
+  syncPolicy:
+    automated:
+      prune: true        # Delete resources removed from git
+      selfHeal: true     # Re-apply if someone manually changes the cluster
+      allowEmpty: false  # Refuse to sync if the path yields zero manifests
+
+    syncOptions:
+      - CreateNamespace=true          # Auto-create 'sentiment' ns if absent
+      - PrunePropagationPolicy=foreground  # Wait for child resources to delete
+      - PruneLast=true                # Prune after all new resources are healthy
+
+    # Retry logic for transient cluster errors
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m
+
+  # ── Health & Diff Ignorance ────────────────────────────────────────────────
+  # Ignore last-applied-configuration annotation diffs (set by kubectl)
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas                   # Allow HPA to scale without drift
+        - /metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration
+
+  # ── Info (shown in ArgoCD UI) ─────────────────────────────────────────────
+  info:
+    - name: "Owner"
+      value: "DevOps Portfolio — UK Market"
+    - name: "API Endpoint"
+      value: "http://localhost:30005"
+    - name: "Image"
+      value: "deepaiorg/sentiment-analysis:latest"

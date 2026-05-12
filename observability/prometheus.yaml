@@ -1,0 +1,308 @@
+###############################################################################
+# observability/prometheus.yaml
+#
+# Observability Stack — Prometheus for the Sentiment API Pod
+# ─────────────────────────────────────────────────────────────────────────────
+# Deploys a Prometheus instance (via ConfigMap + Deployment) inside the
+# 'monitoring' namespace that:
+#   1. Discovers pods via Kubernetes API (serviceAccountName with RBAC)
+#   2. Scrapes pods annotated with prometheus.io/scrape: "true"
+#   3. Exposes Prometheus UI at NodePort 30090
+#
+# Apply:
+#   kubectl apply -f observability/prometheus.yaml
+#   kubectl port-forward svc/prometheus -n monitoring 9090:9090
+#   # OR access via NodePort: http://$(minikube ip):30090
+###############################################################################
+
+---
+# ── Namespace ─────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    managed-by: portfolio
+    purpose: observability
+
+---
+# ── RBAC: ClusterRole — read pods, services, endpoints ───────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus-cluster-reader
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - nodes/proxy
+      - services
+      - endpoints
+      - pods
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["extensions", "networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-cluster-reader-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus-cluster-reader
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: monitoring
+
+---
+# ── ServiceAccount ────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+
+---
+# ── ConfigMap — prometheus.yml ────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval:     15s   # How often to scrape targets
+      evaluation_interval: 15s   # How often to evaluate alerting rules
+      scrape_timeout:      10s
+
+    # ── Alert Rules (inline) ──────────────────────────────────────────────
+    rule_files:
+      - /etc/prometheus/alerts.yml
+
+    # ── Scrape Configs ────────────────────────────────────────────────────
+    scrape_configs:
+
+      # 1. Self-monitoring — Prometheus scrapes itself
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+
+      # 2. Kubernetes node metrics (cAdvisor embedded in kubelet)
+      - job_name: 'kubernetes-nodes-cadvisor'
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+
+      # 3. Pod annotation-based auto-discovery
+      #    Scrapes any pod with: prometheus.io/scrape: "true"
+      #    Our sentiment-api deployment has these annotations set.
+      - job_name: 'kubernetes-pods'
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          # Only scrape pods with prometheus.io/scrape = "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+
+          # Use custom path if prometheus.io/path annotation is set
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+
+          # Use custom port if prometheus.io/port annotation is set
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+
+          # Carry useful labels from Kubernetes metadata
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: kubernetes_pod_name
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            action: replace
+            target_label: kubernetes_node
+
+      # 4. Kubernetes service endpoint scraping (for ClusterIP services)
+      - job_name: 'kubernetes-service-endpoints'
+        kubernetes_sd_configs:
+          - role: endpoints
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_service_name]
+            action: replace
+            target_label: kubernetes_service_name
+
+  alerts.yml: |
+    groups:
+      - name: sentiment-api-alerts
+        rules:
+          # Alert if pod is down for > 1 minute
+          - alert: SentimentAPIPodDown
+            expr: up{kubernetes_namespace="sentiment"} == 0
+            for: 1m
+            labels:
+              severity: critical
+              team: devops
+            annotations:
+              summary: "Sentiment API pod is down"
+              description: "Pod {{ $labels.kubernetes_pod_name }} in namespace {{ $labels.kubernetes_namespace }} has been unreachable for > 1 minute."
+
+          # Alert if error rate (5xx) exceeds 5%
+          - alert: SentimentAPIHighErrorRate
+            expr: |
+              rate(http_requests_total{namespace="sentiment", status=~"5.."}[5m])
+              /
+              rate(http_requests_total{namespace="sentiment"}[5m]) > 0.05
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Sentiment API error rate > 5%"
+              description: "Error rate is {{ $value | humanizePercentage }} over the last 5 minutes."
+
+          # Alert if container memory usage exceeds 450Mi
+          - alert: SentimentAPIHighMemory
+            expr: |
+              container_memory_working_set_bytes{
+                namespace="sentiment",
+                container="sentiment-api"
+              } > 472446402
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Sentiment API memory usage is high"
+              description: "Container {{ $labels.container }} is using {{ $value | humanizeBytes }} of memory."
+
+          # Alert if p95 latency exceeds 2 seconds
+          - alert: SentimentAPISlowResponse
+            expr: |
+              histogram_quantile(0.95,
+                rate(http_request_duration_seconds_bucket{namespace="sentiment"}[5m])
+              ) > 2
+            for: 3m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Sentiment API p95 latency > 2s"
+              description: "95th percentile response time is {{ $value }}s."
+
+---
+# ── Deployment — Prometheus ───────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app: prometheus
+    managed-by: portfolio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.51.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+            - "--storage.tsdb.retention.time=7d"     # 7-day local retention
+            - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+            - "--web.console.templates=/usr/share/prometheus/consoles"
+            - "--web.enable-lifecycle"               # Enable hot-reload via HTTP
+          ports:
+            - containerPort: 9090
+              name: web
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/prometheus
+            - name: prometheus-storage
+              mountPath: /prometheus
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: 9090
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      volumes:
+        - name: config-volume
+          configMap:
+            name: prometheus-config
+        - name: prometheus-storage
+          emptyDir: {}          # Use PersistentVolumeClaim for production
+
+---
+# ── Service — Prometheus NodePort ────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app: prometheus
+spec:
+  type: NodePort
+  selector:
+    app: prometheus
+  ports:
+    - name: web
+      port: 9090
+      targetPort: 9090
+      nodePort: 30090          # Access: http://$(minikube ip):30090
+      protocol: TCP

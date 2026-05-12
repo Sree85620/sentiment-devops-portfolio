@@ -1,0 +1,84 @@
+###############################################################################
+# k8s-manifests/deployment.yaml
+# Plain Kubernetes manifests — tracked by ArgoCD from the local git repo.
+# ArgoCD will apply these files whenever they change on the tracked branch.
+###############################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentiment-api
+  namespace: sentiment
+  labels:
+    app: sentiment-api
+    version: v1
+    managed-by: argocd
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sentiment-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: sentiment-api
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: sentiment-api
+          image: deepaiorg/sentiment-analysis:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5000
+              protocol: TCP
+              name: http
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          env:
+            - name: ENVIRONMENT
+              value: local-dev
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentiment-api-svc
+  namespace: sentiment
+  labels:
+    app: sentiment-api
+    managed-by: argocd
+spec:
+  type: NodePort
+  selector:
+    app: sentiment-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 5000
+      nodePort: 30005
+      protocol: TCP

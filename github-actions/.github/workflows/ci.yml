@@ -1,0 +1,236 @@
+###############################################################################
+# .github/workflows/ci.yml
+#
+# DevSecOps Pipeline — GitHub Actions
+# ─────────────────────────────────────────────────────────────────────────────
+# Stages:
+#   1. secrets-scan   → Gitleaks scans git history for leaked credentials
+#   2. image-scan     → Trivy scans deepaiorg/sentiment-analysis for CVEs
+#   3. lint-manifests → Validate Kubernetes YAML with kubeval
+#   4. deploy-notify  → Placeholder for ArgoCD sync trigger (local webhook)
+#
+# Designed for a self-hosted GitHub Actions runner on Ubuntu (Minikube host).
+# Install runner: https://github.com/actions/runner/releases
+# Self-hosted runners have Docker, kubectl, and minikube pre-installed.
+###############################################################################
+name: "DevSecOps — Sentiment API"
+
+on:
+  push:
+    branches: ["main", "develop"]
+  pull_request:
+    branches: ["main"]
+  # Allow manual trigger from GitHub Actions UI
+  workflow_dispatch:
+
+# ── Global env vars ───────────────────────────────────────────────────────────
+env:
+  TARGET_IMAGE: "deepaiorg/sentiment-analysis:latest"
+  TRIVY_VERSION: "0.51.1"
+  GITLEAKS_VERSION: "8.18.2"
+  MANIFESTS_PATH: "./k8s-manifests"
+
+# Cancel in-progress runs on the same branch (saves CI minutes)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 1: Secrets Detection with Gitleaks
+  # Scans the entire git commit history for secrets, API keys, tokens, etc.
+  # Fails the pipeline if any secret pattern is detected.
+  # ─────────────────────────────────────────────────────────────────────────
+  secrets-scan:
+    name: "🔍 Gitleaks — Secrets Scan"
+    runs-on: self-hosted        # Local Ubuntu runner (change to ubuntu-latest for GitHub-hosted)
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # Full history required for Gitleaks to scan all commits
+
+      - name: "Install Gitleaks ${{ env.GITLEAKS_VERSION }}"
+        run: |
+          echo "📦 Installing Gitleaks v${GITLEAKS_VERSION}..."
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            -o /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: "Run Gitleaks — Full History Scan"
+        id: gitleaks
+        run: |
+          echo "🔐 Scanning git history for secrets..."
+          gitleaks detect \
+            --source="." \
+            --log-level=warn \
+            --report-format=sarif \
+            --report-path=gitleaks-report.sarif \
+            --redact \
+            --verbose
+        # Exit code 1 = leaks found, exit 0 = clean
+        # The step fails the job automatically on non-zero exit
+
+      - name: "Upload Gitleaks SARIF Report"
+        if: always()            # Upload even if scan fails (for GitHub Security tab)
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-sarif-report
+          path: gitleaks-report.sarif
+          retention-days: 30
+
+      - name: "Gitleaks — Summary"
+        if: success()
+        run: echo "✅ No secrets detected in git history."
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 2: Container Image Vulnerability Scan with Trivy
+  # Pulls the target image locally and scans for OS + library CVEs.
+  # Blocks on CRITICAL severity; reports HIGH for visibility.
+  # ─────────────────────────────────────────────────────────────────────────
+  image-scan:
+    name: "🛡️ Trivy — Image Vulnerability Scan"
+    runs-on: self-hosted
+    needs: secrets-scan         # Only scan image after secrets check passes
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Install Trivy ${{ env.TRIVY_VERSION }}"
+        run: |
+          echo "📦 Installing Trivy v${TRIVY_VERSION}..."
+          curl -sSfL \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+            -o /tmp/trivy.tar.gz
+          tar -xzf /tmp/trivy.tar.gz -C /tmp
+          sudo mv /tmp/trivy /usr/local/bin/trivy
+          trivy --version
+
+      - name: "Pull target image locally"
+        run: |
+          echo "🐳 Pulling ${{ env.TARGET_IMAGE }} for local scan..."
+          docker pull ${{ env.TARGET_IMAGE }}
+
+      - name: "Trivy — OS & Library CVE Scan (Table Output)"
+        run: |
+          echo "🔎 Scanning image for vulnerabilities..."
+          trivy image \
+            --exit-code 0 \
+            --severity HIGH,CRITICAL \
+            --format table \
+            --ignore-unfixed \
+            ${{ env.TARGET_IMAGE }}
+
+      - name: "Trivy — SARIF Report (for GitHub Security tab)"
+        run: |
+          trivy image \
+            --exit-code 0 \
+            --severity HIGH,CRITICAL \
+            --format sarif \
+            --output trivy-image-report.sarif \
+            --ignore-unfixed \
+            ${{ env.TARGET_IMAGE }}
+
+      - name: "Trivy — FAIL pipeline on CRITICAL CVEs"
+        run: |
+          echo "🚨 Checking for CRITICAL vulnerabilities (pipeline gate)..."
+          trivy image \
+            --exit-code 1 \
+            --severity CRITICAL \
+            --ignore-unfixed \
+            ${{ env.TARGET_IMAGE }}
+          echo "✅ No unpatched CRITICAL CVEs found."
+
+      - name: "Upload Trivy SARIF Report"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-sarif-report
+          path: trivy-image-report.sarif
+          retention-days: 30
+
+      - name: "Trivy — Filesystem Scan (repo dependencies)"
+        run: |
+          echo "📁 Scanning repo filesystem for misconfigurations..."
+          trivy fs \
+            --exit-code 0 \
+            --severity HIGH,CRITICAL \
+            --format table \
+            .
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 3: Kubernetes Manifest Linting with kubeval
+  # Validates YAML against the Kubernetes OpenAPI schema.
+  # ─────────────────────────────────────────────────────────────────────────
+  lint-manifests:
+    name: "📋 kubeval — Manifest Lint"
+    runs-on: self-hosted
+    needs: secrets-scan
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Install kubeval"
+        run: |
+          curl -sSfL \
+            "https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz" \
+            -o /tmp/kubeval.tar.gz
+          tar -xzf /tmp/kubeval.tar.gz -C /tmp
+          sudo mv /tmp/kubeval /usr/local/bin/kubeval
+          kubeval --version
+
+      - name: "Validate Kubernetes manifests"
+        run: |
+          echo "📐 Validating manifests in ${{ env.MANIFESTS_PATH }}..."
+          kubeval \
+            --strict \
+            --kubernetes-version 1.29.0 \
+            ${{ env.MANIFESTS_PATH }}/*.yaml
+          echo "✅ All manifests are valid."
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 4: ArgoCD Sync Trigger (local webhook to self-hosted ArgoCD)
+  # Notifies ArgoCD to refresh and sync after all security gates pass.
+  # Requires ArgoCD server accessible from the self-hosted runner.
+  # ─────────────────────────────────────────────────────────────────────────
+  deploy-notify:
+    name: "🚀 ArgoCD — Trigger Sync"
+    runs-on: self-hosted
+    needs: [image-scan, lint-manifests]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: "Trigger ArgoCD app sync via CLI"
+        env:
+          ARGOCD_SERVER: "localhost:8080"
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          echo "🔄 Triggering ArgoCD sync for sentiment-api..."
+          argocd app sync sentiment-api \
+            --server $ARGOCD_SERVER \
+            --auth-token $ARGOCD_AUTH_TOKEN \
+            --insecure \
+            --timeout 120
+          echo "⏳ Waiting for app to become healthy..."
+          argocd app wait sentiment-api \
+            --server $ARGOCD_SERVER \
+            --auth-token $ARGOCD_AUTH_TOKEN \
+            --insecure \
+            --health \
+            --timeout 180
+          echo "✅ ArgoCD sync complete — sentiment-api is healthy."
+
+      - name: "Pipeline Summary"
+        if: always()
+        run: |
+          echo "════════════════════════════════════════"
+          echo " DevSecOps Pipeline — Final Status"
+          echo "════════════════════════════════════════"
+          echo " Gitleaks  : ✅ Secrets scan passed"
+          echo " Trivy     : ✅ Image scan passed"
+          echo " kubeval   : ✅ Manifests validated"
+          echo " ArgoCD    : 🚀 Sync triggered"
+          echo " Endpoint  : http://localhost:30005"
+          echo "════════════════════════════════════════"
